@@ -215,6 +215,87 @@ def build_trades_and_afterholdings(
 
     tx = pd.DataFrame(trades)
 
+    # --- Ensure per-account cash balance neutrality by adding a cash adjustment trade ---
+    if not tx.empty:
+        # Sum dollars per account from the trades we just built
+        acct_flow = tx.groupby("Account")["Delta_Dollars"].sum()
+
+        # Build a quick price map and a helper to pick a cash ident per account
+        price_map = df.groupby("_ident")["Price"].median().to_dict()
+
+        def pick_cash_ident(acct_group: pd.DataFrame) -> str | None:
+            # Prefer an actual cash-like holding in this account; else fallback to BIL
+            ids = acct_group["_ident"].unique().tolist()
+            for ident in ids:
+                if is_cashlike(ident):
+                    return ident
+            return "BIL"  # fallback proxy
+
+        # For each account, add one balancing trade in cash
+        for acct, flow in acct_flow.items():
+            if abs(flow) < 0.01:
+                continue  # already balanced enough
+            g_acct = df[df["Account"] == acct]
+            cash_ident = pick_cash_ident(g_acct)
+            px = float(price_map.get(cash_ident, 1.0))
+            if not np.isfinite(px) or px <= 0:
+                px = 1.0  # safeguard
+
+            # If prior trades resulted in net positive dollars (flow > 0), we need to SELL cash (negative shares)
+            # If net negative dollars (flow < 0), we need to BUY cash (positive shares)
+            shares = round(flow / px, 2)  # allow cents precision for cash
+            action = "SELL" if shares > 0 else "BUY"
+            # SELL must be negative shares; BUY positive
+            if action == "SELL":
+                shares = -abs(shares)
+            else:
+                shares = abs(shares)
+
+            tx = pd.concat(
+                [
+                    tx,
+                    pd.DataFrame(
+                        [
+                            {
+                                "Account": acct,
+                                "TaxStatus": g_acct["TaxStatus"].iloc[
+                                    0] if "TaxStatus" in g_acct.columns else assign_tax_status(acct),
+                                "Identifier": cash_ident,
+                                "Sleeve": "Cash",
+                                "Action": action,
+                                "Shares_Delta": shares,
+                                "Price": px,  # per share
+                                "AverageCost": 0.0,  # cash assumed at par for gain math
+                                "Delta_Dollars": shares * px,
+                                "CapGain_Dollars": 0.0,  # cash assumed no cap gains
+                            }
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+
+    # Re-aggregate after inserting cash adjustments (so that net $/account ≈ 0)
+    if not tx.empty:
+        tx["_key"] = tx["Account"].astype(str) + "||" + tx["Identifier"].astype(str)
+        agg = (
+            tx.groupby(["Account", "Identifier", "TaxStatus", "Sleeve"], as_index=False)
+            .agg(
+                Shares_Delta=("Shares_Delta", "sum"),
+                Price=("Price", "last"),
+                AverageCost=("AverageCost", "last"),
+                Delta_Dollars=("Delta_Dollars", "sum"),
+                CapGain_Dollars=("CapGain_Dollars", "sum"),
+                Action=("Action", "last"),
+            )
+        )
+        agg["Action"] = np.where(agg["Shares_Delta"] >= 0, "BUY", "SELL")
+        tx = agg.copy()
+    else:
+        # Build a minimal after = input + sleeve and return early if no trades
+        after = df.copy()
+        return tx, after, {}
+
     if tx.empty:
         after = df.copy()
         return tx, after, {}
