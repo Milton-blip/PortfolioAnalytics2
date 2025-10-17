@@ -1,7 +1,9 @@
 # portfolio_trades/engine.py
 from __future__ import annotations
+
 import re
 from typing import Dict, Tuple
+
 import numpy as np
 import pandas as pd
 
@@ -10,10 +12,10 @@ from .conventions import (
     FALLBACK_PROXY,
     ACCOUNT_TAX_STATUS_RULES,
     DEFAULT_TAX_STATUS,
-    EST_TAX_RATE,
     is_cashlike,
     is_automattic,
 )
+
 
 # -------------------------
 # Helpers
@@ -43,7 +45,7 @@ def map_sleeve(sym: str, name: str) -> str:
 
 
 def _round_shares(dollars: float, px: float, ident: str) -> float:
-    if px <= 0:
+    if px <= 0 or not np.isfinite(px):
         return 0.0
     return round(dollars / px, 2) if is_cashlike(ident) else round(dollars / px, 1)
 
@@ -67,13 +69,18 @@ def build_trades_and_afterholdings(
       Account, TaxStatus, Name, Symbol, Quantity, Price, AverageCost,
       Value (=Quantity*Price), Cost (=Quantity*AverageCost)
     """
+    # Copy and normalize expected columns
     df = h.copy()
+    required = ["Account", "Name", "Symbol", "Quantity", "Price", "AverageCost", "Value"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise SystemExit(f"holdings missing required columns: {missing}")
 
-    # Ensure TaxStatus
+    # Ensure TaxStatus exists
     if "TaxStatus" not in df.columns or df["TaxStatus"].eq("").all():
         df["TaxStatus"] = df["Account"].map(assign_tax_status)
 
-    # Sleeves and identifiers
+    # Create sleeves and identifier
     df["Sleeve"] = [map_sleeve(s, n) for s, n in zip(df["Symbol"], df["Name"])]
     df["_ident"] = df["Symbol"].astype(str)
 
@@ -113,7 +120,10 @@ def build_trades_and_afterholdings(
         W_inv = W.copy()
         if "Illiquid_Automattic" in W_inv.index:
             W_inv = W_inv.drop(index="Illiquid_Automattic")
-        W_inv = W_inv / (W_inv.sum() if W_inv.sum() > 0 else 1.0)
+        denom = W_inv.sum()
+        if denom <= 0:
+            continue
+        W_inv = W_inv / denom
 
         tgt_val = W_inv * investable
         cur_val = g.groupby("Sleeve")["Value"].sum()
@@ -133,9 +143,7 @@ def build_trades_and_afterholdings(
         for sleeve, d_dollars in delta.items():
             if sleeve == "Illiquid_Automattic":
                 continue
-            ident = acct_sleeve_ident.get((acct, sleeve))
-            if ident is None:
-                ident = FALLBACK_PROXY.get(sleeve)
+            ident = acct_sleeve_ident.get((acct, sleeve)) or FALLBACK_PROXY.get(sleeve)
             if ident is None:
                 continue
 
@@ -187,121 +195,39 @@ def build_trades_and_afterholdings(
             )
 
         # ---------- Per-account CASH balancing ----------
-        # Make net dollars == 0 within this account by offsetting in CASH
-        if trades:
-            acct_trades = [t for t in trades if t["Account"] == acct]
-            net_flow = sum(t["Delta_Dollars"] for t in acct_trades)
-            if abs(net_flow) > cash_tolerance:
-                cash_ident = acct_sleeve_ident.get((acct, "Cash")) or FALLBACK_PROXY.get("Cash", "BIL")
-                cash_px = float(price_map.get(cash_ident, 1.0))
-                if np.isfinite(cash_px) and cash_px > 0:
-                    sh_cash = _round_shares(-net_flow, cash_px, cash_ident)  # offset
-                    if sh_cash != 0.0:
-                        # Avg cost for cash is irrelevant for gains (no SELL capgain assumed)
-                        trades.append(
-                            {
-                                "Account": acct,
-                                "TaxStatus": g["TaxStatus"].iloc[0],
-                                "Identifier": cash_ident,
-                                "Sleeve": "Cash",
-                                "Action": "BUY" if sh_cash > 0 else "SELL",
-                                "Shares_Delta": sh_cash,
-                                "Price": cash_px,
-                                "AverageCost": 0.0,
-                                "Delta_Dollars": sh_cash * cash_px,
-                                "CapGain_Dollars": 0.0,
-                            }
-                        )
+        acct_net = sum(t["Delta_Dollars"] for t in trades if t["Account"] == acct)
+        if abs(acct_net) > cash_tolerance:
+            cash_ident = acct_sleeve_ident.get((acct, "Cash")) or FALLBACK_PROXY.get(
+                "Cash", "BIL"
+            )
+            cash_px = float(price_map.get(cash_ident, 1.0))
+            if not np.isfinite(cash_px) or cash_px <= 0:
+                cash_px = 1.0
+            sh_cash = _round_shares(-acct_net, cash_px, cash_ident)  # offset to zero
+            if sh_cash != 0.0:
+                trades.append(
+                    {
+                        "Account": acct,
+                        "TaxStatus": g["TaxStatus"].iloc[0],
+                        "Identifier": cash_ident,
+                        "Sleeve": "Cash",
+                        "Action": "BUY" if sh_cash > 0 else "SELL",
+                        "Shares_Delta": sh_cash,
+                        "Price": cash_px,
+                        "AverageCost": 0.0,
+                        "Delta_Dollars": sh_cash * cash_px,
+                        "CapGain_Dollars": 0.0,
+                    }
+                )
 
     tx = pd.DataFrame(trades)
-
-    # --- Ensure per-account cash balance neutrality by adding a cash adjustment trade ---
-    if not tx.empty:
-        # Sum dollars per account from the trades we just built
-        acct_flow = tx.groupby("Account")["Delta_Dollars"].sum()
-
-        # Build a quick price map and a helper to pick a cash ident per account
-        price_map = df.groupby("_ident")["Price"].median().to_dict()
-
-        def pick_cash_ident(acct_group: pd.DataFrame) -> str | None:
-            # Prefer an actual cash-like holding in this account; else fallback to BIL
-            ids = acct_group["_ident"].unique().tolist()
-            for ident in ids:
-                if is_cashlike(ident):
-                    return ident
-            return "BIL"  # fallback proxy
-
-        # For each account, add one balancing trade in cash
-        for acct, flow in acct_flow.items():
-            if abs(flow) < 0.01:
-                continue  # already balanced enough
-            g_acct = df[df["Account"] == acct]
-            cash_ident = pick_cash_ident(g_acct)
-            px = float(price_map.get(cash_ident, 1.0))
-            if not np.isfinite(px) or px <= 0:
-                px = 1.0  # safeguard
-
-            # If prior trades resulted in net positive dollars (flow > 0), we need to SELL cash (negative shares)
-            # If net negative dollars (flow < 0), we need to BUY cash (positive shares)
-            shares = round(flow / px, 2)  # allow cents precision for cash
-            action = "SELL" if shares > 0 else "BUY"
-            # SELL must be negative shares; BUY positive
-            if action == "SELL":
-                shares = -abs(shares)
-            else:
-                shares = abs(shares)
-
-            tx = pd.concat(
-                [
-                    tx,
-                    pd.DataFrame(
-                        [
-                            {
-                                "Account": acct,
-                                "TaxStatus": g_acct["TaxStatus"].iloc[
-                                    0] if "TaxStatus" in g_acct.columns else assign_tax_status(acct),
-                                "Identifier": cash_ident,
-                                "Sleeve": "Cash",
-                                "Action": action,
-                                "Shares_Delta": shares,
-                                "Price": px,  # per share
-                                "AverageCost": 0.0,  # cash assumed at par for gain math
-                                "Delta_Dollars": shares * px,
-                                "CapGain_Dollars": 0.0,  # cash assumed no cap gains
-                            }
-                        ]
-                    ),
-                ],
-                ignore_index=True,
-            )
-
-    # Re-aggregate after inserting cash adjustments (so that net $/account ≈ 0)
-    if not tx.empty:
-        tx["_key"] = tx["Account"].astype(str) + "||" + tx["Identifier"].astype(str)
-        agg = (
-            tx.groupby(["Account", "Identifier", "TaxStatus", "Sleeve"], as_index=False)
-            .agg(
-                Shares_Delta=("Shares_Delta", "sum"),
-                Price=("Price", "last"),
-                AverageCost=("AverageCost", "last"),
-                Delta_Dollars=("Delta_Dollars", "sum"),
-                CapGain_Dollars=("CapGain_Dollars", "sum"),
-                Action=("Action", "last"),
-            )
-        )
-        agg["Action"] = np.where(agg["Shares_Delta"] >= 0, "BUY", "SELL")
-        tx = agg.copy()
-    else:
-        # Build a minimal after = input + sleeve and return early if no trades
-        after = df.copy()
-        return tx, after, {}
 
     if tx.empty:
         after = df.copy()
         return tx, after, {}
 
-    # Aggregate per (Account, Identifier) after cash balancing
-    agg = (
+    # Aggregate after cash balancing
+    tx = (
         tx.groupby(["Account", "Identifier", "TaxStatus", "Sleeve"], as_index=False)
         .agg(
             Shares_Delta=("Shares_Delta", "sum"),
@@ -310,9 +236,9 @@ def build_trades_and_afterholdings(
             Delta_Dollars=("Delta_Dollars", "sum"),
             CapGain_Dollars=("CapGain_Dollars", "sum"),
         )
+        .copy()
     )
-    agg["Action"] = np.where(agg["Shares_Delta"] >= 0, "BUY", "SELL")
-    tx = agg.copy()
+    tx["Action"] = np.where(tx["Shares_Delta"] >= 0, "BUY", "SELL")
 
     # ---------- Build holdings-after by applying share deltas ----------
     after = df.copy()
@@ -373,49 +299,8 @@ def build_trades_and_afterholdings(
     after["Value"] = after["Quantity"] * after["Price"]
     after["Cost"] = after["Quantity"] * after["AverageCost"]
 
-    # Residuals (should be ~0 now; report only if we couldn’t balance cash)
-    # Residuals (should be ~0 now; report only if we couldn’t balance cash)
+    # Residual cash (should be ~0 now)
     flow = tx.groupby("Account")["Delta_Dollars"].sum()
     residuals = {acct: float(v) for acct, v in flow.items() if abs(v) > cash_tolerance}
 
-    # --- Tax summary per account & tax status ---
-    def tax_rate_for_status(status: str) -> float:
-        """
-        Return the estimated capital gains tax rate for a given tax status.
-        HSAs and Roth IRAs are tax-exempt (0%).
-        """
-        s = status.lower()
-        if "hsa" in s or "roth" in s:
-            return 0.0
-        if "taxable" in s:
-            return EST_TAX_RATE.get("Taxable", 0.15)
-        if "trust" in s:
-            return EST_TAX_RATE.get("Trust", 0.20)
-        # fallback
-        return 0.0
-
-    # compute tax per-account
-    acc_sum = (
-        tx.groupby(["Account", "TaxStatus"], as_index=False)
-        .agg(
-            Total_Buys=("Delta_Dollars", lambda x: x[x > 0].sum()),
-            Total_Sells=("Delta_Dollars", lambda x: -x[x < 0].sum()),
-            Net_CapGain=("CapGain_Dollars", "sum"),
-        )
-    )
-    acc_sum["Est_TaxRate"] = acc_sum["TaxStatus"].apply(tax_rate_for_status)
-    acc_sum["Est_Tax"] = acc_sum["Net_CapGain"] * acc_sum["Est_TaxRate"]
-
-    # --- Summaries ---
-    by_status = (
-        acc_sum.groupby("TaxStatus", as_index=False)
-        .agg(
-            Total_Buys=("Total_Buys", "sum"),
-            Total_Sells=("Total_Sells", "sum"),
-            Net_CapGain=("Net_CapGain", "sum"),
-            Est_Tax=("Est_Tax", "sum"),
-        )
-    )
-
-    # Return full results
     return tx, after, residuals
