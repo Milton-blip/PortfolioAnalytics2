@@ -329,6 +329,17 @@ acc_sum["Est_TaxRate"] = acc_sum["TaxStatus"].apply(tax_rate_for_status)
 acc_sum["Est_Tax"] = acc_sum["Net_CapGain"] * acc_sum["Est_TaxRate"]
 
 # by tax status summary
+# --- Summaries ---
+acc_sum = (
+    tx.groupby(["Account", "TaxStatus"], as_index=False)
+    .agg(
+        Total_Buys=("Total_Buys", "sum"),
+        Total_Sells=("Total_Sells", "sum"),
+        Net_CapGain=("Net_CapGain", "sum"),
+        Est_Tax=("Est_Tax", "sum"),
+    )
+)
+
 by_status = (
     acc_sum.groupby("TaxStatus", as_index=False)
     .agg(
@@ -339,4 +350,5 @@ by_status = (
     )
 )
 
+# Return full results
 return tx, after, residuals
