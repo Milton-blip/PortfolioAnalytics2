@@ -1,10 +1,7 @@
-# portfolio_trades/io_utils.py
-from __future__ import annotations
-
 from pathlib import Path
 import datetime
 import pandas as pd
-import re
+import numpy as np
 
 SCENARIOS = ["Base","Disinflation","Reflation","HardLanding","Stagflation","Geopolitical"]
 
@@ -23,39 +20,16 @@ def _first_existing(paths) -> Path | None:
             return p.resolve()
     return None
 
-def _to_num(series: pd.Series) -> pd.Series:
-    """Coerce money/number strings to float. Handles $ , and parentheses."""
-    if not isinstance(series, pd.Series):
-        series = pd.Series(series)
-    s = series.astype(str)
-    # turn (1234.56) into -1234.56
-    s = s.str.replace(r"\(", "-", regex=True).str.replace(r"\)", "", regex=True)
-    # strip $ and commas/spaces
-    s = s.str.replace(r"[\$,]", "", regex=True).str.strip()
-    s = s.replace({"nan": "", "None": ""})
-    return pd.to_numeric(s, errors="coerce")
-
 def load_holdings(path: str) -> pd.DataFrame:
     """
-    Robustly locate and normalize holdings CSV.
+    Locate and load holdings CSV, normalizing to the canonical schema:
 
-    Accepted input column names (we map them to canonical names):
-      - Symbol → Symbol
-      - Name → Name
-      - Account → Account
-      - TaxStatus → TaxStatus
-      - Quantity → Quantity
-      - PricePerShare | Price | CurrentPrice → Price
-      - CostPerShare | AverageCost → AverageCost
-      - MarketValue | CurrentValue | Value → Value
-      - TotalCost | Cost → Cost
-      - Sleeve (optional) → Sleeve
-      - Tradable (optional) → Tradable
-      - Notes (optional) → Notes
+      Symbol, Name, Account, TaxStatus, Quantity,
+      Price (per share), AverageCost (per share),
+      Value (= Quantity*Price), TotalCost (= Quantity*AverageCost),
+      Sleeve, Tradable (bool)
 
-    Returns a DataFrame with canonical columns at least:
-      Symbol, Name, Account, TaxStatus, Quantity, Price,
-      AverageCost, Value, Cost, Sleeve, Tradable, _ident
+    We do NOT alter your numbers; we only coerce types and fill derived columns.
     """
     candidates = [
         Path(path),
@@ -65,82 +39,82 @@ def load_holdings(path: str) -> pd.DataFrame:
     ]
     found = _first_existing(candidates)
     if not found:
-        tried = "\n  ".join(str(p.resolve()) for p in candidates)
+        tried = "\n  ".join(str(Path(p).resolve()) for p in candidates)
         raise SystemExit(f"holdings.csv not found. Tried:\n  {tried}")
 
     df = pd.read_csv(found)
 
-    # --- Rename to canonical internal names ---
-    rename_priority = [
-        ("PricePerShare", "Price"),
-        ("CurrentPrice", "Price"),
-        ("Price", "Price"),
-        ("CostPerShare", "AverageCost"),
-        ("AverageCost", "AverageCost"),
-        ("MarketValue", "Value"),
-        ("CurrentValue", "Value"),
-        ("Value", "Value"),
-        ("TotalCost", "Cost"),
-        ("Cost", "Cost"),
-    ]
-    # build a rename map using first match present in df
-    rename_map: dict[str, str] = {}
-    present = set(df.columns)
-    for src, dst in rename_priority:
-        if src in present and dst not in rename_map.values():
-            rename_map[src] = dst
-    df = df.rename(columns=rename_map)
+    # Flexible header normalization (case-insensitive)
+    lower = {c.lower(): c for c in df.columns}
+    rename_map = {
+        # per-share price
+        "pricepershare": "Price",
+        "currentprice": "Price",
+        "lastprice": "Price",
+        "price": "Price",
+        # per-share average cost
+        "averagecost": "AverageCost",
+        "avgcost": "AverageCost",
+        "costpershare": "AverageCost",
+        # market value (we recompute anyway)
+        "marketvalue": "Value",
+        "currentvalue": "Value",
+        "currvalue": "Value",
+        # total (aggregate) cost
+        "totalcost": "TotalCost",
+    }
+    for k, v in rename_map.items():
+        if k in lower:
+            df.rename(columns={lower[k]: v}, inplace=True)
 
-    # Ensure required logical columns exist
-    required_min = ["Symbol","Name","Account","TaxStatus","Quantity"]
-    for col in required_min:
-        if col not in df.columns:
-            raise SystemExit(f"holdings.csv is missing required column '{col}'.")
+    # Required logical columns
+    required = ["Symbol","Name","Account","TaxStatus","Quantity","Price","AverageCost"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise SystemExit(f"holdings.csv missing required columns: {missing}")
 
-    # Create optional columns if missing (will compute/fill below)
-    for col in ["Price","AverageCost","Value","Cost","Sleeve","Tradable","Notes"]:
-        if col not in df.columns:
-            if col in ("Sleeve","Tradable","Notes"):
-                df[col] = ""
-            else:
-                df[col] = 0.0
+    # Types/coercion — per-share columns remain per-share
+    for c in ["Quantity","Price","AverageCost"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
-    # --- Numeric coercion for key fields ---
-    for col in ["Quantity","Price","AverageCost","Value","Cost"]:
-        df[col] = _to_num(df[col]).fillna(0.0)
+    # Derived columns (don’t overwrite if present but recompute if clearly stale)
+    if "Value" not in df.columns:
+        df["Value"] = df["Quantity"] * df["Price"]
+    else:
+        # If present but not consistent, fix it silently
+        calc_val = df["Quantity"] * df["Price"]
+        mask = ~np.isclose(df["Value"].astype(float), calc_val.astype(float), rtol=0, atol=0.01)
+        if mask.any():
+            df.loc[mask, "Value"] = calc_val[mask]
 
-    # Back-fill computed values if needed
-    # Value = shares * price; Cost = shares * average cost
-    if (df["Value"] == 0).any() or "MarketValue" in rename_map:
-        df["Value"] = (df["Quantity"] * df["Price"]).round(2)
-    if (df["Cost"] == 0).any() or "TotalCost" in rename_map or "Cost" in rename_map:
-        df["Cost"] = (df["Quantity"] * df["AverageCost"]).round(2)
+    if "TotalCost" not in df.columns:
+        df["TotalCost"] = df["Quantity"] * df["AverageCost"]
+    else:
+        calc_cost = df["Quantity"] * df["AverageCost"]
+        mask = ~np.isclose(df["TotalCost"].astype(float), calc_cost.astype(float), rtol=0, atol=0.01)
+        if mask.any():
+            df.loc[mask, "TotalCost"] = calc_cost[mask]
 
-    # Identifier used throughout engine
+    if "Sleeve" not in df.columns:
+        df["Sleeve"] = "US_Core"
+
+    if "Tradable" not in df.columns:
+        df["Tradable"] = True
+    df["Tradable"] = df["Tradable"].fillna(True).astype(bool)
+
+    # canonical identifier used throughout
     df["_ident"] = df["Symbol"].astype(str)
-
-    # Normalize Tradable to {True/False} if present as strings like "Y"/"N"
-    if "Tradable" in df.columns:
-        def _to_bool(x):
-            if isinstance(x, str):
-                return x.strip().lower() in {"y","yes","true","1"}
-            return bool(x)
-        df["Tradable"] = df["Tradable"].map(_to_bool)
 
     return df
 
 def load_targets(vol_pct_tag: int) -> pd.Series:
     """
-    Load and average target sleeves from portfolio_targets/ directory.
-    Expected filenames:
-      portfolio_targets/allocation_targetVol_<vol%>_<Scenario>_Real.csv
-    Returns a normalized Series (weights sum to 1.0).
+    Average target sleeve weights from portfolio_targets/.
+    Filenames: portfolio_targets/allocation_targetVol_<vol%>_<Scenario>_Real.csv
+    Returns normalized weights summing to 1.0
     """
     base = Path("portfolio_targets")
-    files = [
-        base / f"allocation_targetVol_{vol_pct_tag}_{s}_Real.csv"
-        for s in SCENARIOS
-    ]
+    files = [base / f"allocation_targetVol_{vol_pct_tag}_{s}_Real.csv" for s in SCENARIOS]
     missing = [f for f in files if not f.exists()]
     if missing:
         miss = "\n  ".join(str(m.resolve()) for m in missing)
@@ -153,7 +127,7 @@ def load_targets(vol_pct_tag: int) -> pd.Series:
     W = pd.concat(parts, axis=1).mean(axis=1).clip(lower=0.0)
     total = W.sum()
     if total <= 0:
-        raise SystemExit("Target weights sum to 0 after loading targets.")
+        raise SystemExit("Target weights sum to zero.")
     return (W / total).rename("TargetWeight")
 
 def write_csv(df: pd.DataFrame, path: Path):
