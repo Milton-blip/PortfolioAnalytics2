@@ -374,62 +374,48 @@ def build_trades_and_afterholdings(
     after["Cost"] = after["Quantity"] * after["AverageCost"]
 
     # Residuals (should be ~0 now; report only if we couldn’t balance cash)
+    # Residuals (should be ~0 now; report only if we couldn’t balance cash)
+    flow = tx.groupby("Account")["Delta_Dollars"].sum()
+    residuals = {acct: float(v) for acct, v in flow.items() if abs(v) > cash_tolerance}
 
-
-flow = tx.groupby("Account")["Delta_Dollars"].sum()
-residuals = {acct: float(v) for acct, v in flow.items() if abs(v) > cash_tolerance}
-
-
-# --- Tax summary per account & tax status ---
-def tax_rate_for_status(status: str) -> float:
-    """
-    Return the estimated capital gains tax rate for a given tax status.
-    HSAs and Roth IRAs are tax-exempt (0%).
-    """
-    s = status.lower()
-    if "hsa" in s or "roth" in s:
+    # --- Tax summary per account & tax status ---
+    def tax_rate_for_status(status: str) -> float:
+        """
+        Return the estimated capital gains tax rate for a given tax status.
+        HSAs and Roth IRAs are tax-exempt (0%).
+        """
+        s = status.lower()
+        if "hsa" in s or "roth" in s:
+            return 0.0
+        if "taxable" in s:
+            return EST_TAX_RATE.get("Taxable", 0.15)
+        if "trust" in s:
+            return EST_TAX_RATE.get("Trust", 0.20)
+        # fallback
         return 0.0
-    if "taxable" in s:
-        return EST_TAX_RATE.get("Taxable", 0.15)
-    if "trust" in s:
-        return EST_TAX_RATE.get("Trust", 0.20)
-    # fallback
-    return 0.0
 
-
-# compute tax per-account
-acc_sum = (
-    tx.groupby(["Account", "TaxStatus"], as_index=False)
-    .agg(
-        Total_Buys=("Delta_Dollars", lambda x: x[x > 0].sum()),
-        Total_Sells=("Delta_Dollars", lambda x: -x[x < 0].sum()),
-        Net_CapGain=("CapGain_Dollars", "sum"),
+    # compute tax per-account
+    acc_sum = (
+        tx.groupby(["Account", "TaxStatus"], as_index=False)
+        .agg(
+            Total_Buys=("Delta_Dollars", lambda x: x[x > 0].sum()),
+            Total_Sells=("Delta_Dollars", lambda x: -x[x < 0].sum()),
+            Net_CapGain=("CapGain_Dollars", "sum"),
+        )
     )
-)
-acc_sum["Est_TaxRate"] = acc_sum["TaxStatus"].apply(tax_rate_for_status)
-acc_sum["Est_Tax"] = acc_sum["Net_CapGain"] * acc_sum["Est_TaxRate"]
+    acc_sum["Est_TaxRate"] = acc_sum["TaxStatus"].apply(tax_rate_for_status)
+    acc_sum["Est_Tax"] = acc_sum["Net_CapGain"] * acc_sum["Est_TaxRate"]
 
-# by tax status summary
-# --- Summaries ---
-acc_sum = (
-    tx.groupby(["Account", "TaxStatus"], as_index=False)
-    .agg(
-        Total_Buys=("Total_Buys", "sum"),
-        Total_Sells=("Total_Sells", "sum"),
-        Net_CapGain=("Net_CapGain", "sum"),
-        Est_Tax=("Est_Tax", "sum"),
+    # --- Summaries ---
+    by_status = (
+        acc_sum.groupby("TaxStatus", as_index=False)
+        .agg(
+            Total_Buys=("Total_Buys", "sum"),
+            Total_Sells=("Total_Sells", "sum"),
+            Net_CapGain=("Net_CapGain", "sum"),
+            Est_Tax=("Est_Tax", "sum"),
+        )
     )
-)
 
-by_status = (
-    acc_sum.groupby("TaxStatus", as_index=False)
-    .agg(
-        Total_Buys=("Total_Buys", "sum"),
-        Total_Sells=("Total_Sells", "sum"),
-        Net_CapGain=("Net_CapGain", "sum"),
-        Est_Tax=("Est_Tax", "sum"),
-    )
-)
-
-# Return full results
-return tx, after, residuals
+    # Return full results
+    return tx, after, residuals
